@@ -1,0 +1,340 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from keras import layers, models, Input, Model
+import matplotlib.pyplot as plt
+import cv2
+import os
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import random 
+
+# to mitigate stochasticity 
+# 1. Set seeds
+seed = 34
+random.seed(seed)
+np.random.seed(seed)
+tf.random.set_seed(seed)
+
+# 2. Force deterministic behavior (slower but stable)
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
+
+#------------------------------------------
+
+# Path to your uploaded video
+video_path = '/kaggle/input/video-data/video1.mp4'  # or wherever you uploaded it
+frame_dir = '/content/frames'
+os.makedirs(frame_dir, exist_ok=True)
+
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+print(f"Video FPS: {fps}")
+
+frames = []
+frame_count = 0
+success = True
+
+while success:
+    success, frame = cap.read()
+    if success:
+        frame = cv2.resize(frame, (16, 16))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = frame.astype(np.float32) / 255.0
+        frames.append(frame)
+        frame_count += 1
+
+cap.release()
+frames = np.array(frames)
+print("Extracted frames:", frames.shape)
+
+
+seq_len = 10
+num_seq = len(frames) - seq_len + 1
+
+# Trim and align frames and CSV
+data = pd.read_csv("/kaggle/input/video-data/video1_data.csv")
+min_len = min(len(frames), len(data))
+frames = frames[:min_len]
+data = data.iloc[:min_len]
+
+# Split data
+split_idx = int(len(frames) * 0.8)  # or len(frames) - 290
+
+frames_train = frames[:split_idx]
+frames_test  = frames[split_idx:]
+
+data_train = data.iloc[:split_idx]
+data_test = data.loc[split_idx:, ['Latitude', 'Longitude']]
+
+def create_frame_sequences(frames, labels, extra_inputs=None, seq_len=10):
+    X_seq, y_seq, inp_seq = [], [], []
+
+    for i in range(len(frames) - seq_len + 1):
+        X_seq.append(frames[i:i+seq_len])
+        y_seq.append(labels[i + seq_len - 1])
+
+        if extra_inputs is not None:
+            inp_seq.append(extra_inputs[i:i+seq_len])
+
+    return np.array(X_seq), np.array(y_seq), np.array(inp_seq) if extra_inputs is not None else None
+
+
+y1 = data['Latitude'].values
+y2 = data['Longitude'].values
+alt = data['Altitude'].values
+sp = data['Speed(km/h)'].values
+
+alt_min = np.min(alt)
+alt_max = np.max(alt)
+sp_min = np.min(sp)
+sp_max = np.max(sp)
+
+
+#convert to meters
+start_y1 = np.radians(y1[0])
+start_y2 = np.radians(y2[0])
+y1 = np.radians(y1)
+y2 = np.radians(y2)
+y1 = y1 - start_y1
+y2 = y2 - start_y2
+R = 6371000  #r of earth in m
+
+y1_meters = R * y1
+y2_meters = R * y2 * np.cos(start_y1)
+
+
+y_all = np.column_stack((y1_meters, y2_meters))
+
+sp_tr = sp[:split_idx]
+sp_ts = sp[split_idx:]
+alt_tr = alt[:split_idx]
+alt_ts = alt[split_idx:]
+
+inp_arr = np.column_stack((sp_tr, alt_tr))
+test_arr = np.column_stack((sp_ts, alt_ts))
+
+inp_seq_tr = inp_arr[seq_len - 1:]
+inp_seq_ts = test_arr[seq_len - 1:]
+
+# Train
+X_tr, y_tr, inp_seq_tr = create_frame_sequences(frames_train, y_all[:split_idx], extra_inputs=inp_arr, seq_len=10)
+# Test
+X_ts, y_ts, inp_seq_ts= create_frame_sequences(frames_test, y_all[split_idx:], extra_inputs=test_arr, seq_len=10)
+
+
+y1_min, y1_max = y_tr[:,0].min(), y_tr[:,0].max()
+y2_min, y2_max = y_tr[:,1].min(), y_tr[:,1].max()
+
+
+#normalize
+y_tr[:,0] = (y_tr[:,0] - y1_min) / (y1_max - y1_min + 1e-8)
+y_tr[:,1] = (y_tr[:,1] - y2_min) / (y2_max - y2_min + 1e-8)
+
+y_ts[:,0] = (y_ts[:,0] - y1_min) / (y1_max - y1_min + 1e-8)
+y_ts[:,1] = (y_ts[:,1] - y2_min) / (y2_max - y2_min + 1e-8)
+
+inp_seq_tr[:, 0] = (inp_seq_tr[:, 0] - sp_min) / (sp_max - sp_min + 1e-8)
+inp_seq_tr[:, 1] = (inp_seq_tr[:, 1] - alt_min) / (alt_max - alt_min + 1e-8)
+
+inp_seq_ts[:, 0] = (inp_seq_ts[:, 0] - sp_min) / (sp_max - sp_min + 1e-8)
+inp_seq_ts[:, 1] = (inp_seq_ts[:, 1] - alt_min) / (alt_max - alt_min + 1e-8)
+
+
+print(X_tr.min(), X_tr.max())
+
+
+print("Lat std:", np.std(y_tr[:, 0]))
+print("Lon std:", np.std(y_tr[:, 1]))
+
+
+
+def comp_opt_flow(pre_frame, next_frame):
+    pre_frame = cv2.cvtColor(pre_frame, cv2.COLOR_RGB2GRAY)
+    next_frame = cv2.cvtColor(next_frame, cv2.COLOR_RGB2GRAY)
+
+    flow = cv2.calcOpticalFlowFarneback(pre_frame, next_frame, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    return flow
+
+flow_tr = [] # for each set of adjacent frames
+flow_ts = []
+
+for i in range(1, len(frames_train)):
+    flow_tr.append(comp_opt_flow(frames_train[i-1], frames_train[i]))
+
+for i in range(1, len(frames_test)):
+    flow_ts.append(comp_opt_flow(frames_test[i-1], frames_test[i]))
+
+flow_tr = np.array(flow_tr)
+flow_ts = np.array(flow_ts)
+#flow_tr = flow_tr[:len(X_tr)] # match to X rows
+#flow_ts = flow_ts[:len(X_ts)]
+
+flow_sequences_tr = []
+flow_sequences_ts = []
+
+for i in range(len(flow_tr) - seq_len + 1):
+    seq = flow_tr[i:i+seq_len]  # (10, 16, 16, 2)
+    flow_sequences_tr.append(np.stack(seq))
+
+for i in range(len(flow_ts) - seq_len + 1):
+    seq = flow_ts[i:i+seq_len]  # (10, 16, 16, 2)
+    flow_sequences_ts.append(np.stack(seq))
+
+flow_tr_seq = np.array(flow_sequences_tr)  # (num_samples, 10, 16, 16, 2)
+flow_ts_seq = np.array(flow_sequences_ts)  # (num_samples, 10, 16, 16, 2)
+
+X_tr = X_tr[:len(flow_tr_seq)]
+X_ts = X_ts[:len(flow_ts_seq)]
+inp_seq_tr = inp_seq_tr[:len(flow_tr_seq)]
+inp_seq_ts = inp_seq_ts[:len(flow_ts_seq)]
+print("flow_tr.shape : ",flow_tr.shape, "flow_ts.shape : ", flow_ts.shape)
+
+y_tr = y_tr[:len(flow_tr_seq)]
+y_ts = y_ts[:len(flow_ts_seq)]
+
+print("X_tr shape:", X_tr.shape)
+print("inp_seq_tr shape:", inp_seq_tr.shape)
+print("flow_tr_seq shape:", flow_tr_seq.shape)
+print("y_tr shape:", y_tr.shape)
+
+
+
+# Custom loss functions
+def mse_variance_loss(y_true, y_pred):
+    mse = tf.reduce_mean(tf.square(y_true - y_pred))
+    spread_penalty = -0.001 * tf.math.reduce_std(y_pred)  # encourages variation
+    return mse + spread_penalty
+
+def mse_with_bias_penalty(y_true, y_pred):
+    mse = tf.reduce_mean(tf.square(y_true - y_pred))
+    bias = tf.reduce_mean(y_true - y_pred, axis=0)
+    bias_penalty = tf.reduce_sum(tf.square(bias))
+    return mse + 0.001 * bias_penalty
+
+
+video_input = Input(shape=(10, 16, 16, 3))
+
+x = layers.TimeDistributed(layers.Conv2D(32, (3,3), padding='same', activation='relu'))(video_input)
+x = layers.TimeDistributed(layers.Conv2D(32, (3,3), padding='same', activation='relu'))(x)
+x = layers.TimeDistributed(layers.MaxPooling2D())(x)
+
+x = layers.TimeDistributed(layers.Conv2D(64, (3,3), padding='same', activation='relu'))(x)
+x = layers.TimeDistributed(layers.Conv2D(64, (3,3), padding='same', activation='relu'))(x)
+x = layers.TimeDistributed(layers.MaxPooling2D())(x)
+
+x = layers.TimeDistributed(layers.Conv2D(128, (3,3), padding='same', activation='relu'))(x)
+x = layers.TimeDistributed(layers.GlobalAveragePooling2D())(x)  
+x = layers.LSTM(128, return_sequences=True)(x)
+x = layers.LSTM(64)(x)
+
+
+
+
+aux_input = Input(shape=(10, 2))
+y = layers.LSTM(64, return_sequences=True)(aux_input)
+y = layers.LSTM(32)(y)
+
+combined = layers.Concatenate()([x, y])
+z = layers.Dense(128, activation='relu')(combined)
+#z = layers.Dropout(0.05)(z)  # slight dropout for diversity
+z = layers.Dense(64, activation='relu')(z)
+output = layers.Dense(2, activation='linear')(z)
+
+model = models.Model(inputs=[video_input, aux_input], outputs=output)
+
+model.compile(optimizer='adam',
+              loss=mse_with_bias_penalty)
+
+early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+
+history = model.fit(
+    [X_tr, inp_seq_tr], y_tr,
+    validation_data=([X_ts, inp_seq_ts], y_ts),
+    epochs=1000,
+    batch_size=32,
+    callbacks=[early_stop, reduce_lr]
+)
+
+
+y_pred = model.predict([X_ts, inp_seq_ts])
+model.summary()
+y_pred[:, 0] = y_pred[:, 0] * (y1_max - y1_min + 1e-8) + y1_min
+y_pred[:, 1] = y_pred[:, 1] * (y2_max - y2_min + 1e-8) + y2_min
+
+
+y_pred[:, 0] = y_pred[:, 0] / R
+y_pred[:, 1] = y_pred[:, 1] / (R*np.cos(np.radians(start_y1)))
+
+y_pred[:, 0] = np.degrees(y_pred[:, 0]) + np.degrees(start_y1)
+y_pred[:, 1] = np.degrees(y_pred[:, 1]) + np.degrees(start_y2)
+
+# FIXED y_ts -> DEGREES
+y_ts_denorm = np.copy(y_ts)
+y_ts_denorm[:, 0] = y_ts_denorm[:, 0] * (y1_max - y1_min + 1e-8) + y1_min
+y_ts_denorm[:, 1] = y_ts_denorm[:, 1] * (y2_max - y2_min + 1e-8) + y2_min
+
+y_ts_denorm[:, 0] = y_ts_denorm[:, 0] / R
+y_ts_denorm[:, 1] = y_ts_denorm[:, 1] / (R * np.cos((start_y1)))
+
+y_ts_denorm[:, 0] = np.degrees(y_ts_denorm[:, 0]) + np.degrees(start_y1)
+y_ts_denorm[:, 1] = np.degrees(y_ts_denorm[:, 1]) + np.degrees(start_y2)
+
+inp_arr[:, 0] = inp_arr[:, 0] * (sp_max - sp_min + 1e-8) + sp_min
+inp_arr[:, 1] = inp_arr[:, 1] * (alt_max - alt_min + 1e-8) + alt_min
+# Calculate RMSE
+
+lat_rmse = np.sqrt(np.mean((y_pred[:,0] - y_ts_denorm[:,0])**2))
+lon_rmse = np.sqrt(np.mean((y_pred[:,1] - y_ts_denorm[:,1])**2))
+print("Latitude RMSE:", lat_rmse)
+print("Longitude RMSE:", lon_rmse)
+
+
+
+
+
+
+# Visualize predictions
+plt.figure(figsize=(12,5))
+
+# Actual
+plt.subplot(1,2,1)
+plt.scatter(y_ts_denorm[:,0], y_ts_denorm[:,1], color='blue', label='Actual')
+plt.xlabel('Latitude')
+plt.ylabel('Longitude')
+plt.title('Actual Coordinates')
+plt.legend()
+plt.ticklabel_format(useOffset=False)  # <- disables the 1e-5 offset
+
+# Predicted
+plt.subplot(1,2,2)
+plt.scatter(y_pred[:,0], y_pred[:,1], color='red', label='Predicted')
+plt.xlabel('Latitude')
+plt.ylabel('Longitude')
+plt.title('Predicted Coordinates')
+plt.legend()
+plt.ticklabel_format(useOffset=False)  # <- fixes y-axis offset
+
+plt.show()
+
+unique_preds = np.unique(y_pred.round(5), axis=0)
+print(f"Unique predictions: {len(unique_preds)}")
+
+
+for i in range(30):
+    lat = y_ts_denorm[i, 0]   # scalar
+    lon = y_ts_denorm[i, 1]   # scalar
+    print(f"Actual:    ({lat:.6f}, {lon:.6f})")
+    print(f"Predicted: ({y_pred[i,0]:.6f}, {y_pred[i,1]:.6f})\n")
+
+
+mse = mean_squared_error(y_ts_denorm, y_pred)
+print("Mean Squared Error:", mse)
+
+
+
+
